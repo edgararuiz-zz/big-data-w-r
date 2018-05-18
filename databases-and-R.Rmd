@@ -1,0 +1,361 @@
+---
+title: "Databases and R"
+output: html_notebook
+---
+
+## Connecting to a database
+
+```{r}
+library(knitr)
+include_graphics(("images/drivers.PNG"))
+```
+
+```{r}
+library(odbc)
+
+sort(unique(odbcListDrivers()[[1]]))
+```
+
+
+```{r}
+library(DBI)
+```
+
+
+```{r}
+con <- dbConnect(odbc(), 
+                 Driver = "SQL Server", 
+                 Server = "localhost\\SQLEXPRESS", 
+                 Database = "datawarehouse", 
+                 Trusted_Connection = "True")
+
+```
+
+## Using DBI
+
+```{r}
+dbGetQuery(con, "select year, count(*) from production.flights group by year")
+```
+
+```{sql, connection = con}
+select "origin", count(*) from production.flights group by "origin"
+```
+
+simple_query.sql 
+
+## dplyr
+
+```{r}
+library(dplyr)
+library(dbplyr)
+
+tbl(con, in_schema("production", "flights"))
+
+```
+
+```{r}
+db_flights <- tbl(con, in_schema("production", "flights"))
+```
+
+```{r}
+db_flights %>%
+  head()
+```
+
+### Under the hood
+
+```{r}
+db_flights %>%
+  head() %>%
+  show_query()
+```
+
+```{r}
+sql_render(head(db_flights), con = simulate_mysql())
+```
+
+## Mode dplyr
+
+```{r}
+db_flights %>%
+  group_by(year) %>%
+  tally() 
+```
+
+Create summarizations
+```{r}
+db_flights %>% 
+  group_by(year, month) %>%
+  summarise(
+    no_flights = n(),
+    avg_dep_delay = mean(depdelay, na.rm = TRUE),
+    avg_arr_delay = mean(arrdelay, na.rm = TRUE)
+  )
+```
+
+Join tables 
+```{r}
+db_airports <- tbl(con, in_schema("production", "airports"))
+
+db_joined <- db_flights %>%
+  inner_join(db_airports, by = c("origin" = "faa")) 
+
+db_joined
+```
+
+Top 10 busiest airports.  Take advantage of `dplyr` lazy evaluation
+```{r}
+db_joined %>%
+  group_by(name) %>%
+  tally() %>%
+  arrange(desc(n)) %>%
+  head(10)
+```
+
+## Visualization
+
+```{r}
+library(ggplot2) 
+
+t <- db_joined %>%
+  group_by(name) %>%
+  tally() %>%
+  arrange(desc(n)) %>%
+  head(10) %>%
+  collect() 
+
+  ggplot(t) +
+    geom_col(aes(x = name, y = n)) +
+    coord_flip()
+  
+```
+
+```{r}
+db_joined  %>%
+  group_by(lon, lat) %>%
+  tally() %>%
+  select(n, lon, lat) %>%
+  collect() %>%
+  ggplot() +
+    geom_point(aes(x = lon, y = lat, size = n, color = n), alpha = 0.3)
+```
+
+## dbplot
+
+http://db.rstudio.com/dbplot/
+
+```{r}
+library(dbplot)
+
+db_flights %>%
+  filter(year == 2006) %>%
+  dbplot_line(month , mean(arrdelay, na.rm = TRUE))
+```
+
+```{r}
+db_flights %>%
+  filter(arrdelay < 100, arrdelay > (-100)) %>%
+  dbplot_histogram(arrdelay)
+```
+
+
+## tidypredict
+
+```{r}
+model <- 
+  db_flights %>%
+  head(10000) %>%
+  filter(arrdelay < 100, arrdelay > (-100)) %>%
+  mutate( dayofmonth = paste0("d", dayofmonth)) %>%
+  lm(arrdelay ~  crsdeptime + crsarrtime,  data = .)
+
+summary(model)
+```
+
+
+```{r}
+library(tidypredict)
+
+tidypredict_sql(model, con)
+```
+
+```{r}
+db_flights %>%
+  filter(arrdelay < 100, arrdelay > (-100), year == 2007) %>%
+  tidypredict_to_column(model) %>%
+  select(fit, arrdelay)
+```
+
+```{r}
+db_flights %>%
+  filter(
+    arrdelay < 100, 
+    arrdelay > (-100), 
+    year == 2007,
+    month == 1
+    ) %>%
+  tidypredict_to_column(model) %>%
+  mutate(diff = fit - arrdelay) %>%
+  dbplot_histogram(diff)
+
+```
+
+## modeldb
+
+```{r}
+library(modeldb)
+
+remote_model <- db_flights %>%
+  filter(year == 2006) %>%
+  group_by(month) %>%
+  mutate(
+    arrdelay = as.numeric(arrdelay), 
+    depdelay = as.numeric(depdelay)
+    ) %>%
+  select(arrdelay, depdelay) %>%
+  linear_regression_db(arrdelay)
+    
+remote_model 
+  
+```
+
+```{r, fig.height = 7, fig.width = 4}
+remote_model %>%
+  ggplot() +
+  geom_point(aes(`(Intercept)`, as.factor(month)))
+```
+
+
+## Spark
+
+```{r}
+library(nycflights13)
+library(sparklyr)
+library(dplyr)
+
+sc <- spark_connect(master = "local", version = "2.1.0")
+
+spark_flights <- sdf_copy_to(sc, flights)
+```
+
+```{r}
+df <- spark_flights %>%
+  filter(!is.na(dep_delay)) %>%
+  mutate(
+    month = paste0("m", month),
+    day = paste0("d", day),
+    sched_dep_time = as.numeric(sched_dep_time),
+    dep_delay = as.numeric(dep_delay)
+  ) %>%
+  select(dep_delay, sched_dep_time, month, day, distance) 
+```
+
+
+```{r}
+flights_pipeline <- ml_pipeline(sc) %>%
+  ft_dplyr_transformer(
+    tbl = df
+    ) %>%
+  ft_binarizer(
+    input.col = "dep_delay",
+    output.col = "delayed",
+    threshold = 15
+  ) %>%
+  ft_bucketizer(
+    input.col = "sched_dep_time",
+    output.col = "hours",
+    splits = c(400, 800, 1200, 1600, 2000, 2400)
+  )  %>%
+  ft_r_formula(delayed ~ month + day + hours + distance) %>% 
+  ml_logistic_regression()
+
+flights_pipeline
+```
+
+```{r}
+partitioned_flights <- sdf_partition(
+  spark_flights,
+  training = 0.1,
+  testing = 0.1,
+  rest = 0.9
+)
+```
+
+```{r}
+fitted_pipeline <- ml_fit(
+  flights_pipeline,
+  partitioned_flights$training
+)
+fitted_pipeline
+
+```
+
+
+```{r}
+predictions <- ml_transform(
+  fitted_pipeline,
+  partitioned_flights$testing
+)
+
+predictions %>%
+  group_by(delayed, prediction) %>%
+  tally()
+```
+
+```{r}
+ml_save(
+  flights_pipeline,
+  "flights_pipeline",
+  overwrite = TRUE
+)
+```
+
+
+```{r}
+ml_save(
+  fitted_pipeline,
+  "flights_model",
+  overwrite = TRUE
+)
+```
+
+```{r}
+spark_disconnect(sc)
+```
+
+## Use a re-loaded model
+
+```{r}
+sc <- spark_connect(master = "local", version = "2.1.0")
+spark_flights <- sdf_copy_to(sc, flights)
+```
+
+```{r}
+reloaded_model <- ml_load(sc, "flights_model")
+
+
+new_df <- spark_flights %>%
+  filter(
+    month == 7,
+    day == 5
+  )
+
+ml_transform(reloaded_model, new_df) 
+```
+
+## Re-fit the same pipeline with new data
+
+```{r}
+reloaded_pipeline <- ml_load(sc, "flights_pipeline")
+
+new_model <-  ml_fit(reloaded_pipeline, sample_frac(spark_flights, 0.01))
+
+new_model
+```
+
+
+http://colorado.rstudio.com:3939/content/671/
+
+http://colorado.rstudio.com:3939/content/1101/
+
+

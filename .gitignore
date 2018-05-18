@@ -1,0 +1,8 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+logs
+flights_pipeline
+flights_model
+derby.log
